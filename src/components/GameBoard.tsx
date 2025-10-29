@@ -31,10 +31,34 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
     fetchGameData();
 
     const gamesChannel = supabase
-      .channel('game-updates')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'games', filter: `id=eq.${gameId}` }, fetchGameData)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'players', filter: `game_id=eq.${gameId}` }, fetchGameData)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'moves', filter: `game_id=eq.${gameId}` }, fetchGameData)
+      .channel(`game-updates-${gameId}`)
+      .on('postgres_changes', { 
+        event: '*', 
+        schema: 'public', 
+        table: 'games', 
+        filter: `id=eq.${gameId}` 
+      }, () => {
+        console.log('Game updated');
+        fetchGameData();
+      })
+      .on('postgres_changes', { 
+        event: '*', 
+        schema: 'public', 
+        table: 'players', 
+        filter: `game_id=eq.${gameId}` 
+      }, () => {
+        console.log('Players updated');
+        fetchGameData();
+      })
+      .on('postgres_changes', { 
+        event: '*', 
+        schema: 'public', 
+        table: 'moves', 
+        filter: `game_id=eq.${gameId}` 
+      }, () => {
+        console.log('Moves updated');
+        fetchGameData();
+      })
       .subscribe();
 
     return () => {
@@ -43,14 +67,19 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
   }, [gameId]);
 
   const fetchGameData = async () => {
+    console.log('Fetching game data...');
     const [gameRes, playersRes, movesRes] = await Promise.all([
       supabase.from('games').select('*').eq('id', gameId).single(),
       supabase.from('players').select('*').eq('game_id', gameId).order('created_at', { ascending: true }),
       supabase.from('moves').select('*').eq('game_id', gameId).order('created_at', { ascending: true })
     ]);
 
-    if (gameRes.data) setGame(gameRes.data);
+    if (gameRes.data) {
+      console.log('Game state:', gameRes.data);
+      setGame(gameRes.data);
+    }
     if (playersRes.data) {
+      console.log('Players:', playersRes.data);
       setPlayers(playersRes.data);
       const player = playersRes.data.find(p => p.user_id === userId);
       setCurrentPlayer(player || null);
@@ -192,6 +221,15 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
   const currentTurnIndex = game.current_turn % sortedPlayers.length;
   const activePlayer = sortedPlayers[currentTurnIndex];
   const isMyTurn = game.status === 'in_progress' && currentPlayer.id === activePlayer.id;
+
+  console.log('Turn calculation:', {
+    currentTurn: game.current_turn,
+    totalPlayers: sortedPlayers.length,
+    currentTurnIndex,
+    activePlayerId: activePlayer?.id,
+    currentPlayerId: currentPlayer.id,
+    isMyTurn
+  });
 
   const playerPositions = players.reduce((acc, p) => {
     acc[p.id] = { position: p.current_position, role: p.role as 'mr_x' | 'detective' };
