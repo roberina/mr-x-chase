@@ -45,7 +45,7 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
   const fetchGameData = async () => {
     const [gameRes, playersRes, movesRes] = await Promise.all([
       supabase.from('games').select('*').eq('id', gameId).single(),
-      supabase.from('players').select('*').eq('game_id', gameId),
+      supabase.from('players').select('*').eq('game_id', gameId).order('created_at', { ascending: true }),
       supabase.from('moves').select('*').eq('game_id', gameId).order('created_at', { ascending: true })
     ]);
 
@@ -68,6 +68,11 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
     if (transport === 'taxi') available = allMoves.taxi;
     else if (transport === 'bus') available = allMoves.bus;
     else if (transport === 'underground') available = allMoves.underground;
+    else if (transport === 'black') available = [
+      ...allMoves.taxi,
+      ...allMoves.bus,
+      ...allMoves.underground
+    ];
 
     setAvailableMoves(available);
   };
@@ -75,24 +80,69 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
   const handleMove = async (toPosition: number) => {
     if (!currentPlayer || !selectedTransport || !game) return;
 
-    const ticketField = `${selectedTransport}_tickets` as keyof Player;
-    const currentTickets = currentPlayer[ticketField] as number;
-
-    if (currentTickets <= 0) {
-      toast.error(`No ${selectedTransport} tickets left!`);
-      return;
-    }
+    // Prevent double-clicking/multiple simultaneous moves
+    if (selectedTransport === null) return;
+    
+    // Temporarily disable further moves
+    const tempTransport = selectedTransport;
+    setSelectedTransport(null);
+    setAvailableMoves([]);
 
     try {
-      // Create move
+      // Always refetch the latest game state to check turn
+      const { data: latestGame } = await supabase
+        .from('games')
+        .select('*')
+        .eq('id', gameId)
+        .single();
+
+      if (!latestGame) {
+        toast.error("Could not load game state.");
+        setSelectedTransport(tempTransport);
+        return;
+      }
+
+      // Refetch players with consistent ordering
+      const { data: latestPlayers } = await supabase
+        .from('players')
+        .select('*')
+        .eq('game_id', gameId)
+        .order('created_at', { ascending: true });
+
+      if (!latestPlayers) {
+        toast.error("Could not load players.");
+        setSelectedTransport(tempTransport);
+        return;
+      }
+
+      const sortedPlayers = [...latestPlayers];
+      const currentTurnIndex = latestGame.current_turn % sortedPlayers.length;
+      const activePlayer = sortedPlayers[currentTurnIndex];
+
+      // Check whose turn it actually is
+      if (currentPlayer.id !== activePlayer.id) {
+        toast.error("It's not your turn!");
+        return; // Don't restore transport selection
+      }
+
+      const ticketField = `${tempTransport}_tickets` as keyof Player;
+      const currentTickets = currentPlayer[ticketField] as number;
+
+      if (currentTickets <= 0) {
+        toast.error(`No ${tempTransport} tickets left!`);
+        setSelectedTransport(tempTransport);
+        return;
+      }
+
+      // Create move record
       await supabase.from('moves').insert([{
         game_id: gameId,
         player_id: currentPlayer.id,
         from_position: currentPlayer.current_position,
         to_position: toPosition,
-        transport: selectedTransport,
-        turn_number: game.current_turn,
-        revealed: currentPlayer.role === 'mr_x' && (game.current_turn % 3 === 0 || game.current_turn === 1)
+        transport: tempTransport,
+        turn_number: latestGame.current_turn,
+        revealed: currentPlayer.role === 'mr_x' && (latestGame.current_turn % 3 === 0 || latestGame.current_turn === 1)
       }]);
 
       // Update player position and tickets
@@ -103,16 +153,23 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
 
       await supabase.from('players').update(updates).eq('id', currentPlayer.id);
 
-      // Update game turn
-      await supabase.from('games').update({
-        current_turn: game.current_turn + 1
-      }).eq('id', gameId);
+      // Advance the turn - use latestGame.current_turn to avoid race conditions
+      const { error: updateError } = await supabase
+        .from('games')
+        .update({
+          current_turn: latestGame.current_turn + 1
+        })
+        .eq('id', gameId);
 
-      setSelectedTransport(null);
-      setAvailableMoves([]);
-      toast.success("Move completed!");
+      if (updateError) throw updateError;
+
+      toast.success("Move completed! Next player's turn.");
+      
+      // Refresh game data
+      await fetchGameData();
     } catch (error: any) {
-      toast.error(error.message);
+      toast.error(error.message || "Failed to make move");
+      setSelectedTransport(tempTransport); // Restore selection on error
     }
   };
 
@@ -130,12 +187,17 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
     return <div className="flex items-center justify-center min-h-screen">Loading...</div>;
   }
 
+  // --- TURN LOGIC ---
+  const sortedPlayers = [...players].sort((a, b) => a.created_at.localeCompare(b.created_at));
+  const currentTurnIndex = game.current_turn % sortedPlayers.length;
+  const activePlayer = sortedPlayers[currentTurnIndex];
+  const isMyTurn = game.status === 'in_progress' && currentPlayer.id === activePlayer.id;
+
   const playerPositions = players.reduce((acc, p) => {
     acc[p.id] = { position: p.current_position, role: p.role as 'mr_x' | 'detective' };
     return acc;
   }, {} as { [key: string]: { position: number; role: 'mr_x' | 'detective' } });
 
-  const isMyTurn = game.status === 'in_progress';
   const isMrXRevealTurn = game.current_turn % 3 === 0 || game.current_turn === 1;
 
   return (
@@ -173,8 +235,11 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
               </CardHeader>
               <CardContent className="space-y-2">
                 <p className="text-sm text-muted-foreground">
-                  {game.status === 'waiting' ? 'Waiting for players...' : 'Game in progress'}
+                  {game.status === 'waiting'
+                    ? 'Waiting for players...'
+                    : `Current turn: ${activePlayer.role === 'mr_x' ? '🎩 Mr. X' : '🔍 Detective'} (${activePlayer.user_id === userId ? 'You' : 'Opponent'})`}
                 </p>
+
                 {game.status === 'waiting' && game.mr_x_player === userId && (
                   <Button onClick={startGame} className="w-full bg-primary">
                     Start Game
@@ -197,6 +262,7 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
                   <span>🚕 Taxi</span>
                   <Badge variant="secondary">{currentPlayer.taxi_tickets}</Badge>
                 </Button>
+
                 <Button
                   onClick={() => handleTransportSelect('bus')}
                   className="w-full justify-between bg-background/50 hover:bg-bus/20 text-foreground"
@@ -206,6 +272,7 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
                   <span>🚌 Bus</span>
                   <Badge variant="secondary">{currentPlayer.bus_tickets}</Badge>
                 </Button>
+
                 <Button
                   onClick={() => handleTransportSelect('underground')}
                   className="w-full justify-between bg-background/50 hover:bg-underground/20 text-foreground"
@@ -215,6 +282,7 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
                   <span>🚇 Underground</span>
                   <Badge variant="secondary">{currentPlayer.underground_tickets}</Badge>
                 </Button>
+
                 {currentPlayer.role === 'mr_x' && (
                   <Button
                     onClick={() => handleTransportSelect('black')}
@@ -235,12 +303,27 @@ export const GameBoard = ({ gameId, userId, onLeaveGame }: GameBoardProps) => {
               </CardHeader>
               <CardContent className="space-y-2">
                 {players.map(p => (
-                  <div key={p.id} className="flex justify-between items-center">
+                  <div
+                    key={p.id}
+                    className={`flex justify-between items-center ${activePlayer.id === p.id ? 'bg-primary/10 p-1 rounded-lg' : ''}`}
+                  >
                     <span className="text-sm text-foreground">
                       {p.role === 'mr_x' ? '🎩 Mr. X' : '🔍 Detective'}
                     </span>
-                    <Badge variant={p.user_id === userId ? 'default' : 'secondary'}>
-                      {p.user_id === userId ? 'You' : 'Player'}
+                    <Badge
+                      variant={
+                        p.id === activePlayer.id
+                          ? 'default'
+                          : p.user_id === userId
+                          ? 'secondary'
+                          : 'outline'
+                      }
+                    >
+                      {p.user_id === userId
+                        ? 'You'
+                        : activePlayer.id === p.id
+                        ? 'Moving'
+                        : 'Player'}
                     </Badge>
                   </div>
                 ))}
